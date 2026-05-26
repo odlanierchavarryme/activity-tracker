@@ -225,6 +225,22 @@ nav button.active{color:var(--text);border-bottom-color:var(--text)}
     </div>
     <div class="preview-box" id="csv-preview"></div>
   </div>
+  <div class="exp-section">
+    <div class="exp-row" style="flex-direction:column;align-items:flex-start;gap:10px;border-bottom:none">
+      <div>
+        <div class="exp-label" style="font-weight:500">Importar CSV</div>
+        <div class="exp-sublabel">Recupera registros exportados anteriormente. No sobreescribe entradas existentes.</div>
+      </div>
+      <label style="width:100%;display:block">
+        <input type="file" id="import-file-input" accept=".csv" style="display:none" onchange="importCSV(this)">
+        <span id="import-btn" onclick="document.getElementById('import-file-input').click()"
+          style="display:block;text-align:center;padding:10px;border:1px dashed var(--border2);border-radius:var(--rm);font-size:13px;color:var(--muted);cursor:pointer">
+          Seleccionar archivo CSV…
+        </span>
+      </label>
+      <div id="import-result" style="display:none;font-size:12px;padding:8px 10px;border-radius:var(--rm);width:100%"></div>
+    </div>
+  </div>
 </div>
 
 <!-- CONFIGURACIÓN -->
@@ -1270,6 +1286,123 @@ renderConfig=function(){
   const footer=document.getElementById('sync-footer');
   if(footer&&driveToken)footer.style.display='';
 };
+
+/* ---- IMPORT CSV ---- */
+function importCSV(input){
+  const file=input.files[0];
+  if(!file)return;
+  const reader=new FileReader();
+  reader.onload=function(e){
+    const text=e.target.result;
+    const lines=text.split('\n').map(l=>l.trim()).filter(Boolean);
+    if(lines.length<2){showImportResult('El archivo está vacío o no es válido.','error');return;}
+
+    const header=parseCSVLine(lines[0]);
+    const idx={
+      entry_id:header.indexOf('entry_id'),
+      activity_id:header.indexOf('activity_id'),
+      activity_name:header.indexOf('activity_name'),
+      attribute:header.indexOf('attribute'),
+      tags:header.indexOf('tags'),
+      date:header.indexOf('date'),
+      start_iso:header.indexOf('start_iso'),
+      end_iso:header.indexOf('end_iso'),
+      created_at_iso:header.indexOf('created_at_iso'),
+      modified_at_iso:header.indexOf('modified_at_iso'),
+    };
+    if(idx.entry_id===-1||idx.start_iso===-1){showImportResult('Formato de CSV no reconocido.','error');return;}
+
+    const existingIds=new Set(state.entries.map(e=>e.id));
+    const existingActIds=new Map(state.activities.map(a=>[a.id,a]));
+    const existingActNames=new Map(state.activities.map(a=>[a.name.toLowerCase(),a]));
+
+    let importedEntries=0, skippedEntries=0, importedActs=0;
+
+    for(let i=1;i<lines.length;i++){
+      const cols=parseCSVLine(lines[i]);
+      if(cols.length<4)continue;
+      const entryId=cols[idx.entry_id]||uid();
+      if(existingIds.has(entryId)){skippedEntries++;continue;}
+
+      const actId=cols[idx.activity_id]||uid();
+      const actName=cols[idx.activity_name]||'Sin nombre';
+      const attr=cols[idx.attribute]||'unk';
+      const tagsRaw=cols[idx.tags]||'';
+      const tags=tagsRaw?tagsRaw.split('|').filter(Boolean):[];
+      const dateStr=cols[idx.date]||'';
+      const startIso=cols[idx.start_iso]||'';
+      const endIso=cols[idx.end_iso]||'';
+      const createdIso=idx.created_at_iso>=0?cols[idx.created_at_iso]:'';
+      const modifiedIso=idx.modified_at_iso>=0?cols[idx.modified_at_iso]:'';
+
+      if(!startIso)continue;
+      const startTs=new Date(startIso).getTime();
+      const endTs=endIso?new Date(endIso).getTime():null;
+      if(isNaN(startTs))continue;
+
+      // Ensure activity exists
+      if(!existingActIds.has(actId)){
+        const nameMatch=existingActNames.get(actName.toLowerCase());
+        if(!nameMatch){
+          const newAct={id:actId,name:actName,attr,tags,useCount:0};
+          state.activities.push(newAct);
+          existingActIds.set(actId,newAct);
+          existingActNames.set(actName.toLowerCase(),newAct);
+          importedActs++;
+        }
+      }
+
+      const entry={
+        id:entryId,
+        actId:existingActIds.has(actId)?actId:(existingActNames.get(actName.toLowerCase())||{id:actId}).id,
+        actName,
+        date:dateStr||new Date(startTs).toISOString().slice(0,10),
+        startTs,
+        endTs:endTs&&!isNaN(endTs)?endTs:null,
+        createdAt:createdIso?new Date(createdIso).getTime():startTs,
+        modifiedAt:modifiedIso?new Date(modifiedIso).getTime():startTs,
+      };
+      state.entries.push(entry);
+      existingIds.add(entryId);
+      importedEntries++;
+    }
+
+    // Update useCounts from imported entries
+    state.activities.forEach(a=>{
+      a.useCount=state.entries.filter(e=>e.actId===a.id).length;
+    });
+
+    save();
+    input.value='';
+    const msg=`Importadas ${importedEntries} entradas${importedActs>0?' y '+importedActs+' actividades nuevas':''}${skippedEntries>0?'. Omitidas '+skippedEntries+' ya existentes':''}.`;
+    showImportResult(msg,'ok');
+    renderRegistro();
+  };
+  reader.readAsText(file,'UTF-8');
+}
+
+function parseCSVLine(line){
+  const result=[];let cur='';let inQ=false;
+  for(let i=0;i<line.length;i++){
+    const c=line[i];
+    if(c==='"'){
+      if(inQ&&line[i+1]==='"'){cur+='"';i++;}
+      else{inQ=!inQ;}
+    } else if(c===','&&!inQ){result.push(cur.trim());cur='';}
+    else{cur+=c;}
+  }
+  result.push(cur.trim());
+  return result;
+}
+
+function showImportResult(msg,type){
+  const el=document.getElementById('import-result');
+  if(!el)return;
+  el.style.display='block';
+  el.style.background=type==='ok'?'var(--pos-bg)':'var(--neg-bg)';
+  el.style.color=type==='ok'?'var(--pos)':'var(--neg)';
+  el.textContent=msg;
+}
 
 /* ---- INIT ---- */
 load();
